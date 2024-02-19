@@ -8,6 +8,8 @@ from pytorch_lightning.callbacks.lr_monitor import LearningRateMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DeepSpeedStrategy, DDPStrategy
+from pytorch_lightning.plugins.environments import SLURMEnvironment
+
 import torch
 
 from openfold.config import model_config
@@ -41,8 +43,70 @@ from scripts.zero_to_fp32 import (
 )
 
 from openfold.utils.logger import PerformanceLoggingCallback
+from pytorch_lightning.trainer.connectors.signal_connector import _SignalConnector
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from subprocess import call
+
+import signal
+from typing import Union
+from types import FrameType
+
+log = logging.getLogger(__name__)
 
 
+_SIGNUM = Union[int, signal.Signals]
+
+class CustomSignalConnector(_SignalConnector):
+    def __init__(self, trainer: "pl.Trainer") -> None:
+        super().__init__(trainer)
+        self.saved_checkpoint = False
+
+    def _sigterm_handler_fn(self, signum: _SIGNUM, _: FrameType) -> None:
+        # only do that if the rank is 0
+        if not self.saved_checkpoint:
+            rank_zero_info("SIGTERM received, attempting graceful shutdown...")
+            self._slurm_sigusr_handler_fn(signum, _)
+    
+    def _slurm_sigusr_handler_fn(self, signum: _SIGNUM, _: FrameType) -> None:
+        rank_zero_info(f"Handling auto-requeue signal: {signum}")
+
+        # save logger to make sure we get all the metrics
+        for logger in self.trainer.loggers:
+            logger.finalize("finished")
+
+        hpc_save_path = self.trainer._checkpoint_connector.hpc_save_path(self.trainer.default_root_dir)
+        self.saved_checkpoint = True
+        self.trainer.save_checkpoint(hpc_save_path)
+
+        if self.trainer.is_global_zero:
+            # find job id
+            array_job_id = os.getenv("SLURM_ARRAY_JOB_ID")
+            if array_job_id is not None:
+                array_task_id = os.environ["SLURM_ARRAY_TASK_ID"]
+                job_id = f"{array_job_id}_{array_task_id}"
+            else:
+                job_id = os.environ["SLURM_JOB_ID"]
+
+            cmd = ["scontrol", "requeue", job_id]
+
+            # requeue job
+            log.info(f"requeing job {job_id}...")
+            try:
+                result = call(cmd)
+            except FileNotFoundError:
+                # This can occur if a subprocess call to `scontrol` is run outside a shell context
+                # Re-attempt call (now with shell context). If any error is raised, propagate to user.
+                # When running a shell command, it should be passed as a single string.
+                joint_cmd = [str(x) for x in cmd]
+                result = call(" ".join(joint_cmd), shell=True)
+
+            # print result text
+            if result == 0:
+                log.info(f"requeued exp {job_id}")
+            else:
+                log.warning("requeue failed...")
+            
+        
 class OpenFoldWrapper(pl.LightningModule):
     def __init__(self, config):
         super(OpenFoldWrapper, self).__init__()
@@ -68,14 +132,14 @@ class OpenFoldWrapper(pl.LightningModule):
             self.log(
                 f"{phase}/{loss_name}",
                 indiv_loss,
-                on_step=train, on_epoch=(not train), logger=True,
+                on_step=train, on_epoch=(not train), logger=True, sync_dist=True
             )
 
             if (train):
                 self.log(
                     f"{phase}/{loss_name}_epoch",
                     indiv_loss,
-                    on_step=False, on_epoch=True, logger=True,
+                    on_step=False, on_epoch=True, logger=True, sync_dist=True
                 )
 
         with torch.no_grad():
@@ -89,10 +153,13 @@ class OpenFoldWrapper(pl.LightningModule):
             self.log(
                 f"{phase}/{k}",
                 torch.mean(v),
-                on_step=False, on_epoch=True, logger=True
+                on_step=False, on_epoch=True, logger=True, sync_dist=True
             )
 
     def training_step(self, batch, batch_idx):
+        #print current learning rate:
+        
+        print(self.trainer.lr_scheduler_configs[0].scheduler.optimizer.param_groups[0]["lr"])
         if (self.ema.device != batch["aatype"].device):
             self.ema.to(batch["aatype"].device)
 
@@ -116,6 +183,7 @@ class OpenFoldWrapper(pl.LightningModule):
 
         # Log it
         self._log(loss_breakdown, batch, outputs)
+        self.log('loss', loss, prog_bar=True, sync_dist=True)
 
         return loss
 
@@ -153,7 +221,7 @@ class OpenFoldWrapper(pl.LightningModule):
 
         self._log(loss_breakdown, batch, outputs, train=False)
 
-    def on_validation_epoch_end(self, _):
+    def on_validation_epoch_end(self):
         # Restore the model weights to normal
         self.model.load_state_dict(self.cached_weights)
         self.cached_weights = None
@@ -385,10 +453,24 @@ def main(args):
         freeze_path = f"{wdb_logger.experiment.dir}/package_versions.txt"
         os.system(f"{sys.executable} -m pip freeze > {freeze_path}")
         wdb_logger.experiment.save(f"{freeze_path}")
-
+    
+    if (args.resume_model_weights_only):
+        ckpt_path = None
+    else:
+        ckpt_path = args.resume_from_ckpt
+    # plugins = []
+    # # Check if we are in a slurm environment
+    # if (os.environ.get("SLURM_JOB_ID") is not None):
+    #     plugins = [SLURMEnvironment()]
+    #     # Check if there is a file that starts with hpc in the checkpoint directory:
+    #     if (os.path.exists(args.output_dir)):
+    #         hpc_ckpt = [
+    #             f for f in os.listdir(args.output_dir) if f.startswith("hpc")]
+    #         if (len(hpc_ckpt) > 0):
+    #             ckpt_path = 'hpc'
     # Raw dump of all args from pl.Trainer constructor
     trainer_kws = set([
-        'accelerator', 'strategy', 'devices', 'num_nodes', 'precision', 'logger', 'callbacks', 'fast_dev_run', 'max_epochs', 'min_epochs', 'max_steps', 'min_steps', 'max_tim', 'limit_train_batches', 'limit_val_batches', 'limit_test_batches', 'limit_predict_batches', 'overfit_batches', 'val_check_interval', 'check_val_every_n_epoch', 'num_sanity_val_steps', 'log_every_n_steps', 'enable_checkpointing', 'enable_progress_bar', 'enable_model_summary', 'accumulate_grad_batches', 'gradient_clip_val', 'gradient_clip_algorithm', 'deterministic', 'benchmark', 'inference_mode', 'use_distributed_sampler', 'profiler', 'detect_anomaly', 'barebones', 'plugins', 'sync_batchnorm', 'reload_dataloaders_every_n_epochs', 'default_root_dir',
+        'accelerator', 'strategy', 'devices', 'num_nodes', 'precision', 'logger', 'callbacks', 'fast_dev_run', 'max_epochs', 'min_epochs', 'max_steps', 'min_steps', 'max_time', 'limit_train_batches', 'limit_val_batches', 'limit_test_batches', 'limit_predict_batches', 'overfit_batches', 'val_check_interval', 'check_val_every_n_epoch', 'num_sanity_val_steps', 'log_every_n_steps', 'enable_checkpointing', 'enable_progress_bar', 'enable_model_summary', 'accumulate_grad_batches', 'gradient_clip_val', 'gradient_clip_algorithm', 'deterministic', 'benchmark', 'inference_mode', 'use_distributed_sampler', 'profiler', 'detect_anomaly', 'barebones', 'plugins', 'sync_batchnorm', 'reload_dataloaders_every_n_epochs', 'default_root_dir',
     ])
     trainer_args = {k: v for k, v in vars(args).items() if k in trainer_kws}
     trainer_args.update({
@@ -398,11 +480,9 @@ def main(args):
         'logger': loggers,
     })
     trainer = pl.Trainer(**trainer_args)
+    trainer._signal_connector = CustomSignalConnector(trainer)
 
-    if (args.resume_model_weights_only):
-        ckpt_path = None
-    else:
-        ckpt_path = args.resume_from_ckpt
+    print('ckpt_path:', ckpt_path)
 
     trainer.fit(
         model_module,
@@ -608,7 +688,7 @@ if __name__ == "__main__":
         "--num_nodes", type=int, default=1,
     )
     parser.add_argument(
-        "--gpus", type=int, default=1,
+        "--devices", type=int, default=1,
     )
     parser.add_argument(
         "--precision", type=str, default=None,
@@ -625,8 +705,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_sanity_val_steps", type=int, default=0,
     )
-
-    #  parser = pl.Trainer.add_argparse_args(parser)
+    parser.add_argument(
+        "--limit_val_batches", type=float, default=1.0,
+    )
+    parser.add_argument(
+        "--accumulate_grad_batches", type=int, default=1,
+    )
+    
+    parser.add_argument(
+        "--gpus", type=int, default=1,
+    )
+    
+    # parser = pl.Trainer.add_argparse_args(parser)
     #
     #  # Disable the initial validation pass
     #  parser.set_defaults(
@@ -660,5 +750,6 @@ if __name__ == "__main__":
 
     # This re-applies the training-time filters at the beginning of every epoch
     args.reload_dataloaders_every_n_epochs = 1
-
+    # Make the signal handler global and replace any other signal handler for this signal in the process:    
+    
     main(args)

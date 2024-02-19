@@ -735,13 +735,28 @@ class DataPipeline:
             fp.close()
         else:
             # Now will split the following steps into multiple processes 
-            current_directory = os.path.dirname(os.path.abspath(__file__))
-            cmd = f"{current_directory}/tools/parse_msa_files.py"
-            msa_data_path = subprocess.run(['python',cmd, f"--alignment_dir={alignment_dir}"],capture_output=True, text=True)
-            msa_data_path = msa_data_path.stdout.lstrip().rstrip()
-            msa_data = pickle.load((open(msa_data_path,'rb')))
-            os.remove(msa_data_path)
+            # current_directory = os.path.dirname(os.path.abspath(__file__))
+            # cmd = f"{current_directory}/tools/parse_msa_files.py"
+            # msa_data_path = subprocess.run(['python',cmd, f"--alignment_dir={alignment_dir}"],capture_output=True, text=True)
+            # msa_data_path = msa_data_path.stdout.lstrip().rstrip()
+            # msa_data = pickle.load((open(msa_data_path,'rb')))
+            # os.remove(msa_data_path)
+            for f in os.listdir(alignment_dir):
+                path = os.path.join(alignment_dir, f)
+                filename, ext = os.path.splitext(f)
 
+                if ext == ".a3m":
+                    with open(path, "r") as fp:
+                        msa = parsers.parse_a3m(fp.read())
+                elif ext == ".sto" and filename not in ["uniprot_hits", "hmm_output"]:
+                    with open(path, "r") as fp:
+                        msa = parsers.parse_stockholm(
+                            fp.read()
+                        )
+                else:
+                    continue
+
+                msa_data[f] = msa   
         return msa_data
 
     def _parse_template_hit_files(
